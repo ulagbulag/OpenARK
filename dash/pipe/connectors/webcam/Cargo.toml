@@ -30,6 +30,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 derivative = { workspace = true }
 futures = { workspace = true }
+image = { workspace = true, features = ["jpeg"] }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 v4l = { workspace = true }

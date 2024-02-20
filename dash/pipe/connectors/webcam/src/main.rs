@@ -10,6 +10,7 @@ use dash_pipe_provider::{
     storage::StorageIO, FunctionContext, PipeArgs, PipeMessage, PipeMessages, PipePayload,
 };
 use derivative::Derivative;
+use image::{codecs, RgbImage};
 use serde::{Deserialize, Serialize};
 use tokio::{spawn, sync::mpsc};
 use v4l::{
@@ -55,15 +56,6 @@ pub struct FunctionArgs {
 
     #[arg(
         long,
-        env = "PIPE_WEBCAM_CAMERA_FPS",
-        value_name = "FPS",
-        default_value_t = FunctionArgs::default_camera_fps()
-    )]
-    #[serde(default = "FunctionArgs::default_camera_fps")]
-    camera_fps: f64,
-
-    #[arg(
-        long,
         env = "PIPE_WEBCAM_CAMERA_WIDTH",
         value_name = "SIZE",
         default_value_t = FunctionArgs::default_camera_width()
@@ -90,10 +82,6 @@ impl FunctionArgs {
         4
     }
 
-    const fn default_camera_fps() -> f64 {
-        60.0
-    }
-
     const fn default_camera_width() -> u32 {
         1920
     }
@@ -108,7 +96,7 @@ impl FunctionArgs {
 pub struct Function {
     camera_codec: ImageCodec,
     #[derivative(Debug = "ignore")]
-    capture: mpsc::Receiver<Result<(Bytes, Metadata), String>>,
+    capture: mpsc::Receiver<Result<(Vec<u8>, Metadata), String>>,
     ctx: FunctionContext,
     frame_counter: FrameCounter,
     frame_size: ImageSize,
@@ -127,13 +115,12 @@ impl ::dash_pipe_provider::FunctionBuilder for Function {
     ) -> Result<Self> {
         async fn loop_capture_frames(
             args: FunctionArgs,
-            tx: &mpsc::Sender<Result<(Bytes, Metadata), String>>,
+            tx: &mpsc::Sender<Result<(Vec<u8>, Metadata), String>>,
         ) -> Result<()> {
             let FunctionArgs {
                 camera_buffer_size,
                 camera_codec,
                 camera_device,
-                camera_fps,
                 camera_height,
                 camera_width,
             } = args.clone();
@@ -167,7 +154,7 @@ impl ::dash_pipe_provider::FunctionBuilder for Function {
                     .next()
                     .map_err(|error| anyhow!("failed to open video capture: {error}"))?;
 
-                tx.send(Ok((Bytes::from(buf.to_vec()), *metadata))).await?;
+                tx.send(Ok((buf.to_vec(), *metadata))).await?;
             }
         }
 
@@ -217,11 +204,26 @@ impl ::dash_pipe_provider::Function for Function {
         let (frame, timestamp) = match self.capture.recv().await {
             Some(Ok((frame, meta))) => match self.camera_codec {
                 ImageCodec::Jpeg => {
+                    // parse image
+                    let ImageSize { width, height } = self.frame_size;
+                    let image = RgbImage::from_raw(width, height, frame)
+                        .ok_or_else(|| anyhow!("failed to get sufficient frame data"))?;
+
+                    // encode image
+                    let mut buffer = vec![];
+                    match self.camera_codec {
+                        ImageCodec::Jpeg => {
+                            image.write_with_encoder(codecs::jpeg::JpegEncoder::new(&mut buffer))
+                        }
+                    }
+                    .map_err(|error| anyhow!("failed to encode video frame: {error}"))?;
+
+                    // convert timestamp
                     let timestamp = NaiveDateTime::from_timestamp_opt(
                         meta.timestamp.sec,
                         (meta.timestamp.usec * 1_000) as u32,
                     );
-                    (frame, timestamp)
+                    (Bytes::from(buffer), timestamp)
                 }
             },
             Some(Err(error)) => return self.ctx.terminate_err(anyhow!(error)),
