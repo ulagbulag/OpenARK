@@ -20,14 +20,16 @@ workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-dash-openapi = { path = "../../../openapi" }
+dash-openapi = { path = "../../../openapi", features = ["clap"] }
 dash-pipe-provider = { path = "../../provider" }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 derivative = { workspace = true }
-image = { workspace = true, features = ["png"] }
-opencv = { workspace = true, features = ["imgcodecs", "videoio"] }
+futures = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+v4l = { workspace = true }

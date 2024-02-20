@@ -1,19 +1,23 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use clap::{Parser, ValueEnum};
+use bytes::Bytes;
+use chrono::{DateTime, NaiveDateTime, Utc};
+use clap::Parser;
+use dash_openapi::image::{ImageCodec, ImageSize};
 use dash_pipe_provider::{
     storage::StorageIO, FunctionContext, PipeArgs, PipeMessage, PipeMessages, PipePayload,
 };
 use derivative::Derivative;
-use image::{codecs, RgbImage};
-use opencv::{
-    core::{Mat, MatTraitConst, MatTraitConstManual, Vec3b, Vector},
-    imgcodecs,
-    videoio::{self, VideoCapture, VideoCaptureTrait, VideoCaptureTraitConst},
-};
 use serde::{Deserialize, Serialize};
+use tokio::{spawn, sync::mpsc};
+use v4l::{
+    buffer::{Metadata, Type as BufferType},
+    io::{mmap::Stream, traits::CaptureStream},
+    video::Capture,
+    Device, FourCC,
+};
 
 fn main() {
     PipeArgs::<Function>::from_env().loop_forever()
@@ -21,28 +25,33 @@ fn main() {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Parser)]
 pub struct FunctionArgs {
-    #[arg(long, env = "PIPE_WEBCAM_CAMERA_DEVICE", value_name = "PATH")]
-    camera_device: String,
+    #[arg(
+        long,
+        env = "PIPE_WEBCAM_CAMERA_DEVICE",
+        value_name = "INDEX",
+        default_value_t = FunctionArgs::default_camera_device()
+    )]
+    #[serde(default = "FunctionArgs::default_camera_device")]
+    camera_device: usize,
 
     #[arg(
         long,
-        env = "PIPE_WEBCAM_CAMERA_DECODER",
+        env = "PIPE_WEBCAM_CAMERA_BUFFER_SIZE",
+        value_name = "INDEX",
+        default_value_t = FunctionArgs::default_camera_buffer_size()
+    )]
+    #[serde(default = "FunctionArgs::default_camera_buffer_size")]
+    camera_buffer_size: usize,
+
+    #[arg(
+        long,
+        env = "PIPE_WEBCAM_CAMERA_CODEC",
         value_name = "TYPE",
         value_enum,
         default_value_t = Default::default()
     )]
     #[serde(default)]
-    camera_decoder: CameraDecoder,
-
-    #[arg(
-        long,
-        env = "PIPE_WEBCAM_CAMERA_ENCODER",
-        value_name = "TYPE",
-        value_enum,
-        default_value_t = Default::default()
-    )]
-    #[serde(default)]
-    camera_encoder: CameraEncoder,
+    camera_codec: ImageCodec,
 
     #[arg(
         long,
@@ -73,6 +82,14 @@ pub struct FunctionArgs {
 }
 
 impl FunctionArgs {
+    const fn default_camera_device() -> usize {
+        0
+    }
+
+    const fn default_camera_buffer_size() -> usize {
+        4
+    }
+
     const fn default_camera_fps() -> f64 {
         60.0
     }
@@ -86,104 +103,15 @@ impl FunctionArgs {
     }
 }
 
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-    ValueEnum,
-)]
-#[serde(rename_all = "camelCase")]
-pub enum CameraDecoder {
-    #[default]
-    Jpeg,
-}
-
-impl CameraDecoder {
-    const fn as_fourcc(&self) -> [char; 4] {
-        match self {
-            Self::Jpeg => ['M', 'J', 'P', 'G'],
-        }
-    }
-
-    fn as_video_writer(&self) -> Result<f64> {
-        let [c1, c2, c3, c4] = self.as_fourcc();
-        videoio::VideoWriter::fourcc(c1, c2, c3, c4)
-            .map(Into::into)
-            .map_err(Into::into)
-    }
-}
-
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-    ValueEnum,
-)]
-#[serde(rename_all = "camelCase")]
-pub enum CameraEncoder {
-    Bmp,
-    #[default]
-    Jpeg,
-    Png,
-}
-
-impl CameraEncoder {
-    const fn as_extension(&self) -> &'static str {
-        match self {
-            CameraEncoder::Bmp => ".bmp",
-            CameraEncoder::Jpeg => ".jpeg",
-            CameraEncoder::Png => ".png",
-        }
-    }
-}
-
-impl PartialEq<CameraEncoder> for CameraDecoder {
-    fn eq(&self, other: &CameraEncoder) -> bool {
-        match self {
-            Self::Jpeg => matches!(other, CameraEncoder::Jpeg),
-        }
-    }
-}
-
-impl PartialEq<CameraDecoder> for CameraEncoder {
-    fn eq(&self, other: &CameraDecoder) -> bool {
-        match self {
-            Self::Bmp => false,
-            Self::Jpeg => matches!(other, CameraDecoder::Jpeg),
-            Self::Png => false,
-        }
-    }
-}
-
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct Function {
-    camera_encoder: CameraEncoder,
+    camera_codec: ImageCodec,
     #[derivative(Debug = "ignore")]
-    capture: VideoCapture,
+    capture: mpsc::Receiver<Result<(Bytes, Metadata), String>>,
     ctx: FunctionContext,
-    #[derivative(Debug = "ignore")]
-    frame: Mat,
     frame_counter: FrameCounter,
-    frame_size: FrameSize,
-    #[derivative(Debug = "ignore")]
-    params: Vector<i32>,
+    frame_size: ImageSize,
 }
 
 pub type FunctionOutput = ::dash_openapi::image::Image;
@@ -197,37 +125,82 @@ impl ::dash_pipe_provider::FunctionBuilder for Function {
         ctx: &mut FunctionContext,
         _storage: &Arc<StorageIO>,
     ) -> Result<Self> {
-        let FunctionArgs {
-            camera_device,
-            camera_decoder,
-            camera_encoder,
-            camera_fps,
-            camera_width,
-            camera_height,
-        } = args.clone();
+        async fn loop_capture_frames(
+            args: FunctionArgs,
+            tx: &mpsc::Sender<Result<(Bytes, Metadata), String>>,
+        ) -> Result<()> {
+            let FunctionArgs {
+                camera_buffer_size,
+                camera_codec,
+                camera_device,
+                camera_fps,
+                camera_height,
+                camera_width,
+            } = args.clone();
 
-        let mut capture = VideoCapture::from_file(&camera_device, videoio::CAP_ANY)
-            .map_err(|error| anyhow!("failed to init video capture: {error}"))?;
-        if !capture.is_opened().unwrap_or_default() {
-            bail!("failed to open video capture");
+            let device = Device::new(camera_device)
+                .map_err(|error| anyhow!("failed to init video device: {error}"))?;
+
+            {
+                let mut fmt = device
+                    .format()
+                    .map_err(|error| anyhow!("failed to retrieve video format: {error}"))?;
+                fmt.width = camera_width;
+                fmt.height = camera_height;
+                fmt.fourcc = FourCC::new(camera_codec.as_fourcc());
+                device
+                    .set_format(&fmt)
+                    .map_err(|error| anyhow!("failed to set video format: {error}"))?;
+            }
+
+            let mut capture = Stream::with_buffers(
+                &device,
+                BufferType::VideoCapture,
+                camera_buffer_size
+                    .try_into()
+                    .map_err(|_| anyhow!("too large camera buffer size: {camera_buffer_size}"))?,
+            )
+            .map_err(|error| anyhow!("failed to open video capture: {error}"))?;
+
+            loop {
+                let (buf, metadata) = capture
+                    .next()
+                    .map_err(|error| anyhow!("failed to open video capture: {error}"))?;
+
+                tx.send(Ok((Bytes::from(buf.to_vec()), *metadata))).await?;
+            }
         }
 
-        capture.set(videoio::CAP_PROP_FOURCC, camera_decoder.as_video_writer()?)?;
-        capture.set(videoio::CAP_PROP_FPS, camera_fps)?;
-        capture.set(videoio::CAP_PROP_FRAME_WIDTH, camera_width.into())?;
-        capture.set(videoio::CAP_PROP_FRAME_HEIGHT, camera_height.into())?;
+        let FunctionArgs {
+            camera_codec,
+            camera_buffer_size,
+            camera_height,
+            camera_width,
+            ..
+        } = args;
+
+        let (tx, rx) = mpsc::channel(*camera_buffer_size);
+        spawn({
+            let args = args.clone();
+            async move {
+                if let Err(error) = loop_capture_frames(args, &tx).await {
+                    tx.send(Err(error.to_string())).await.ok();
+                }
+            }
+        });
 
         Ok(Self {
-            camera_encoder,
-            capture,
+            camera_codec: *camera_codec,
             ctx: {
                 ctx.disable_load();
                 ctx.clone()
             },
-            frame: Default::default(),
+            capture: rx,
             frame_counter: Default::default(),
-            frame_size: Default::default(),
-            params: Default::default(),
+            frame_size: ImageSize {
+                width: *camera_width,
+                height: *camera_height,
+            },
         })
     }
 }
@@ -241,105 +214,45 @@ impl ::dash_pipe_provider::Function for Function {
         &mut self,
         _inputs: PipeMessages<<Self as ::dash_pipe_provider::Function>::Input>,
     ) -> Result<PipeMessages<<Self as ::dash_pipe_provider::Function>::Output>> {
-        let (frame, (width, height)) = match self.capture.read(&mut self.frame) {
-            Ok(true) => {
-                match self.camera_encoder {
-                    CameraEncoder::Bmp | CameraEncoder::Jpeg => {
-                        // convert image
-                        let mut buffer = Default::default();
-                        match imgcodecs::imencode(
-                            self.camera_encoder.as_extension(),
-                            &self.frame,
-                            &mut buffer,
-                            &self.params,
-                        ) {
-                            Ok(true) => {
-                                let frame = Vec::from(buffer).into();
-                                let width = self.frame.cols().try_into().unwrap_or_default();
-                                let height = self.frame.rows().try_into().unwrap_or_default();
-                                (frame, (width, height))
-                            }
-                            Ok(false) => bail!("failed to encode image frame"),
-                            Err(error) => {
-                                bail!("failed to encode image frame: {error}")
-                            }
-                        }
-                    }
-                    CameraEncoder::Png => {
-                        // load image
-                        let buffer = Mat::data_typed::<Vec3b>(&self.frame)
-                            .map_err(|error| anyhow!("failed to catch frame data type: {error}"))?
-                            .iter()
-                            .flat_map(|pixel| {
-                                let [p1, p2, p3] = pixel.0;
-                                [p3, p2, p1]
-                            })
-                            .collect();
-
-                        // parse image
-                        let (width, height) = self.frame_size.get_or_insert(&self.frame);
-                        let image = RgbImage::from_raw(width, height, buffer)
-                            .ok_or_else(|| anyhow!("failed to get sufficient frame data"))?;
-
-                        // encode image
-                        let mut buffer = vec![];
-                        match self.camera_encoder {
-                            CameraEncoder::Bmp | CameraEncoder::Jpeg => {
-                                unreachable!("unsupported image codec for native image crate")
-                            }
-                            CameraEncoder::Png => {
-                                image.write_with_encoder(codecs::png::PngEncoder::new(&mut buffer))
-                            }
-                        }
-                        .map(|()| (buffer.into(), (width, height)))
-                        .map_err(|error| anyhow!("failed to encode image frame: {error}"))?
-                    }
+        let (frame, timestamp) = match self.capture.recv().await {
+            Some(Ok((frame, meta))) => match self.camera_codec {
+                ImageCodec::Jpeg => {
+                    let timestamp = NaiveDateTime::from_timestamp_opt(
+                        meta.timestamp.sec,
+                        (meta.timestamp.usec * 1_000) as u32,
+                    );
+                    (frame, timestamp)
                 }
-            }
-            Ok(false) => {
+            },
+            Some(Err(error)) => return self.ctx.terminate_err(anyhow!(error)),
+            None => {
                 return self
                     .ctx
                     .terminate_err(anyhow!("video capture is disconnected!"))
             }
-            Err(error) => bail!("failed to capture a frame: {error}"),
         };
 
         let frame_idx = self.frame_counter.next();
         let payloads = vec![PipePayload::new(
             format!(
                 "images/{frame_idx:06}{ext}",
-                ext = self.camera_encoder.as_extension(),
+                ext = self.camera_codec.as_extension(),
             ),
             Some(frame),
         )];
         let value = FunctionOutput {
-            width,
-            height,
+            codec: self.camera_codec,
             index: frame_idx,
+            size: self.frame_size,
         };
 
-        Ok(PipeMessages::Single(PipeMessage::with_payloads(
-            payloads, value,
-        )))
-    }
-}
-
-#[derive(Debug, Default)]
-struct FrameSize(Option<(u32, u32)>);
-
-impl FrameSize {
-    fn get_or_insert(&mut self, frame: &Mat) -> (u32, u32) {
-        match self.0 {
-            Some(size) => size,
-            None => {
-                let width = frame.cols() as u32;
-                let height = frame.rows() as u32;
-                let size = (width, height);
-
-                self.0.replace(size);
-                size
+        Ok(PipeMessages::Single({
+            let mut payload = PipeMessage::with_payloads(payloads, value);
+            if let Some(timestamp) = timestamp {
+                payload.set_timestamp(DateTime::from_naive_utc_and_offset(timestamp, Utc));
             }
-        }
+            payload
+        }))
     }
 }
 

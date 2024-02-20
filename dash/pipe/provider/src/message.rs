@@ -555,6 +555,10 @@ where
         self.timestamp
     }
 
+    pub fn set_timestamp(&mut self, timestamp: DateTime<Utc>) {
+        self.timestamp = timestamp;
+    }
+
     pub fn to_bytes(&self, encoder: Codec) -> Result<Bytes>
     where
         Payload: Serialize,
@@ -682,7 +686,7 @@ where
         PipePayload {
             key: key.clone(),
             model: model.clone(),
-            storage: storage.clone(),
+            storage: *storage,
             value: None,
         }
     }

@@ -19,6 +19,10 @@ workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+
 [dependencies]
+clap = { workspace = true, optional = true }
 schemars = { workspace = true }
 serde = { workspace = true }
